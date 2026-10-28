@@ -342,12 +342,19 @@ def _update_fenced(homes) -> bool:
             if not raw:
                 # An exclusive first publish in flight (contract A3), not yet a dead claim.
                 if time.time() - path.stat().st_mtime < update_lock.EMPTY_MARKER_GRACE_SECONDS:
+                    _fence_diag(fence_home, "empty_grace")
                     return True
         except FileNotFoundError:
             continue
-        except OSError:
+        except OSError as exc:
+            _fence_diag(fence_home, f"read_oserror:{exc!r}")
             return True
-        if update_lock.judge_marker(raw)[0] in {"live", "ours"} or update_lock.checkout_lock_held():
+        verdict = update_lock.judge_marker(raw)[0]
+        if verdict in {"live", "ours"}:
+            _fence_diag(fence_home, f"marker_{verdict}", raw)
+            return True
+        if update_lock.checkout_lock_held():
+            _fence_diag(fence_home, "checkout_lock_held", raw)
             return True
     return False
 
@@ -493,3 +500,37 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
         return _refused(home)
     except OSError:
         return GatewayDiscovery("inaccessible", reason_code="runtime_start_failed")
+
+
+
+def _fence_diag(fence_home, reason, raw=b""):
+    import json
+    import os
+    import time
+    try:
+        from hermes_cli import update_lock
+        info = {"t": time.time(), "me": os.getpid(), "reason": reason, "raw": raw.decode("utf-8", "replace")[:400]}
+        if raw:
+            m = update_lock._parse_marker(raw)
+            for role, pid, ct in (("owner", m.pid, m.create_time), ("delegate", m.delegate_pid, m.delegate_create_time)):
+                if not pid or pid <= 0:
+                    continue
+                row = {"pid": pid, "recorded_ct": ct, "alive": update_lock._pid_alive(pid)}
+                try:
+                    import psutil
+                    p = psutil.Process(pid)
+                    row.update(name=p.name(), ct=p.create_time(), ppid=p.ppid(), cmd=" ".join(p.cmdline())[:300])
+                except Exception as exc:
+                    row["err"] = repr(exc)
+                row["live"] = update_lock._identity_live(pid, ct, m.age())
+                info[role] = row
+        try:
+            info["lock_held"] = update_lock.checkout_lock_held()
+        except Exception as exc:
+            info["lock_err"] = repr(exc)
+        log = fence_home / "logs" / "fence-diag.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(info) + "\n")
+    except Exception:
+        pass
